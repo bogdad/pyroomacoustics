@@ -475,6 +475,74 @@ class MicrophoneArray(object):
         else:
             self.signals = signals
 
+    def record_block(self, signals_block, fs):
+        """
+        Append one block of signals to the recorded signals for streaming mode.
+
+        This method is designed for block-by-block recording in streaming
+        applications. It accumulates audio blocks over time, building up
+        the full recording incrementally.
+
+        Parameters
+        ----------
+        signals_block : ndarray
+            A 2D array of shape (n_mics, block_size) containing one block
+            of audio from each microphone.
+        fs : float
+            Sampling frequency of the signals block (must match across calls)
+
+        Raises
+        ------
+        ValueError
+            If the number of microphones doesn't match the array geometry
+        ValueError
+            If signals_block is not a 2D array
+        ValueError
+            If sampling frequency changes between calls
+
+        Notes
+        -----
+        - On the first call, initializes self.signals with the first block
+        - On subsequent calls, concatenates new blocks to existing recording
+        - Resampling is NOT supported in streaming mode (fs must match self.fs)
+        - To start a new recording, set mic_array.signals = None first
+
+        Examples
+        --------
+        >>> mic_array.signals = None  # Reset recording
+        >>> for block in audio_blocks:
+        ...     mic_array.record_block(block, fs=16000)
+        >>> # mic_array.signals now contains full concatenated recording
+
+        See Also
+        --------
+        record : Batch recording method for full signals
+        """
+        if signals_block.ndim != 2:
+            raise ValueError(
+                f"signals_block must be a 2D array, got {signals_block.ndim}D"
+            )
+
+        if signals_block.shape[0] != self.M:
+            raise ValueError(
+                f"signals_block should have {self.M} rows (one per microphone), "
+                f"got {signals_block.shape[0]}"
+            )
+
+        if fs != self.fs:
+            raise ValueError(
+                f"Streaming mode does not support resampling. "
+                f"Expected fs={self.fs}, got fs={fs}. "
+                f"Use matching sample rates or batch mode with record()."
+            )
+
+        if self.signals is None:
+            # First block - initialize
+            self.signals = signals_block.copy()
+        else:
+            # Subsequent blocks - append
+            self.signals = np.concatenate([self.signals, signals_block], axis=1)
+
     def to_wav(self, filename, mono=False, norm=False, bitdepth=float):
         """
         Save all the signals to wav files.

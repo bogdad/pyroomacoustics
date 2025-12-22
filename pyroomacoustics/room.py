@@ -2722,6 +2722,168 @@ class Room(object):
         if return_premix:
             return premix_signals
 
+    def init_streaming(self, block_size):
+        """
+        Initialize streaming mode for block-based simulation.
+
+        This method prepares the room for processing audio in blocks rather than
+        all at once. It creates a streaming convolver for each source-microphone
+        pair using pre-computed RIRs. After initialization, use simulate_block()
+        to process audio block-by-block.
+
+        Parameters
+        ----------
+        block_size : int
+            Number of samples to process per block. Smaller blocks reduce latency
+            but may increase computational overhead. Typical values: 128, 256, 512.
+
+        Raises
+        ------
+        ValueError
+            If compute_rir() has not been called before this method
+
+        Notes
+        -----
+        - Must call compute_rir() before init_streaming()
+        - RIRs are fixed after initialization (room geometry cannot change)
+        - For moving sources, need to re-initialize streaming mode
+        - All sources must provide blocks of exactly block_size samples
+
+        Examples
+        --------
+        >>> room = pra.ShoeBox([4, 6, 3], fs=16000)
+        >>> room.add_source([1, 2, 1.5])
+        >>> room.add_microphone_array(pra.linear_2D_array([3, 3], 4, 0, 0.1))
+        >>> room.compute_rir()
+        >>> room.init_streaming(block_size=256)
+        >>> # Now ready for simulate_block()
+        """
+        if self.rir is None or len(self.rir) == 0:
+            raise ValueError(
+                "Must call compute_rir() before init_streaming(). "
+                "RIRs are required for streaming simulation."
+            )
+
+        if block_size <= 0:
+            raise ValueError(f"block_size must be positive, got {block_size}")
+
+        # Import here to avoid issues if streaming module isn't available
+        from .streaming import PartitionedConvolver
+
+        self.block_size = block_size
+        self.convolvers = {}
+
+        # Create a convolver for each source-microphone pair
+        n_mics = self.mic_array.R.shape[1]  # number of microphones
+        n_sources = len(self.sources)
+
+        for m in range(n_mics):
+            for s in range(n_sources):
+                rir = self.rir[m][s]
+                self.convolvers[(m, s)] = PartitionedConvolver(rir, block_size)
+
+        self._streaming_initialized = True
+
+        if hasattr(self, 'verbose') and self.verbose:
+            print(
+                f"Streaming initialized: {len(self.convolvers)} convolvers "
+                f"({n_mics} mics × {n_sources} sources), block_size={block_size}"
+            )
+
+    def simulate_block(self, source_blocks):
+        """
+        Process one block from each source through room acoustics.
+
+        This method applies pre-computed RIRs to input audio blocks using
+        efficient streaming convolution. It simulates the acoustic propagation
+        from all sources to all microphones for one time block.
+
+        Parameters
+        ----------
+        source_blocks : array_like
+            Audio blocks from each source. Can be:
+            - 1D array of length block_size (single source)
+            - 2D array of shape (n_sources, block_size)
+            Each row corresponds to one source in the order they were added.
+
+        Returns
+        -------
+        mic_signals : ndarray
+            Mixed signals at each microphone, shape (n_mics, block_size).
+            Each row corresponds to one microphone.
+
+        Raises
+        ------
+        ValueError
+            If init_streaming() has not been called first
+        ValueError
+            If number of source blocks doesn't match number of sources
+        ValueError
+            If block size doesn't match the initialized block_size
+
+        Notes
+        -----
+        - Maintains internal state across calls for seamless streaming
+        - Source order must match the order sources were added to the room
+        - Output includes contributions from all sources, convolved with RIRs
+        - Does not include AWGN noise (add separately if needed)
+
+        Examples
+        --------
+        >>> # Single source
+        >>> source_block = np.random.randn(256)
+        >>> mic_block = room.simulate_block(source_block)
+        >>>
+        >>> # Multiple sources
+        >>> source_blocks = np.random.randn(3, 256)  # 3 sources
+        >>> mic_block = room.simulate_block(source_blocks)
+        >>>
+        >>> # Continuous processing
+        >>> for i in range(n_blocks):
+        ...     source_block = get_next_audio_block()
+        ...     mic_block = room.simulate_block(source_block)
+        ...     process(mic_block)
+        """
+        if not hasattr(self, "_streaming_initialized") or not self._streaming_initialized:
+            raise ValueError(
+                "Must call init_streaming(block_size) before simulate_block(). "
+                "Streaming mode is not initialized."
+            )
+
+        # Handle both 1D (single source) and 2D (multiple sources) input
+        source_blocks = np.atleast_2d(source_blocks)
+
+        # If input was 1D, atleast_2d makes it (1, N), which is correct
+        # If input was already 2D, it's unchanged
+        n_sources_provided = source_blocks.shape[0]
+        block_size_provided = source_blocks.shape[1]
+
+        n_mics = self.mic_array.R.shape[1]
+        n_sources = len(self.sources)
+
+        if n_sources_provided != n_sources:
+            raise ValueError(
+                f"Expected {n_sources} source blocks, got {n_sources_provided}. "
+                f"Provide one block per source in the order they were added."
+            )
+
+        if block_size_provided != self.block_size:
+            raise ValueError(
+                f"Expected block size {self.block_size}, got {block_size_provided}. "
+                f"All blocks must match the block_size set in init_streaming()."
+            )
+
+        # Initialize output buffer
+        mic_signals = np.zeros((n_mics, self.block_size))
+
+        # Apply RIR convolution for each source-mic pair and accumulate
+        for m in range(n_mics):
+            for s in range(n_sources):
+                convolved = self.convolvers[(m, s)].process_block(source_blocks[s])
+                mic_signals[m] += convolved
+
+        return mic_signals
+
     def direct_snr(self, x, source=0):
         """Computes the direct Signal-to-Noise Ratio"""
 
